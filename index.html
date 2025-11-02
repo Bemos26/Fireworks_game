@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic Fireworks Generator</title>
+    <style>
+        /* Use a custom dark theme for the fireworks display */
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0d0d1a; /* Very dark blue/purple night sky */
+            font-family: 'Inter', sans-serif;
+            cursor: crosshair;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #controls {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border-radius: 12px;
+            backdrop-filter: blur(5px);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+            text-align: center;
+            font-size: 14px;
+            z-index: 10;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            user-select: none;
+            /* Flex layout for better control on mobile */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            max-width: 90%;
+            width: auto;
+        }
+
+        #controls p {
+            margin: 0 0 10px 0;
+            font-weight: 500;
+        }
+
+        #gemini-controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+        }
+
+        #promptInput {
+            padding: 8px;
+            border-radius: 8px;
+            border: none;
+            width: 250px;
+            max-width: 100%;
+            margin-bottom: 8px;
+            background: rgba(255, 255, 255, 0.9);
+            color: #0d0d1a;
+            font-size: 14px;
+        }
+
+        .gemini-button {
+            background-color: #6a0dad; /* Royal Purple */
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.2s, transform 0.1s;
+            font-weight: 600;
+        }
+
+        .gemini-button:hover {
+            background-color: #7d3dbd;
+        }
+
+        .gemini-button:active {
+            transform: scale(0.98);
+        }
+    </style>
+    <!-- Firebase SDKs are required for API key authentication in this environment -->
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore-compat.js"></script>
+</head>
+<body>
+    <canvas id="fireworksCanvas"></canvas>
+    <div id="controls">
+        <p>Click or tap anywhere to launch a new firework!</p>
+        <!-- LLM Control Panel -->
+        <div id="gemini-controls" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.2);">
+            <input type="text" id="promptInput" placeholder="e.g., 'A slow, dreamy ocean theme'">
+            <button id="designButton" class="gemini-button">✨ Design a Show</button>
+            <div id="designStatus" style="font-size: 12px; margin-top: 5px; color: #a0a0ff;">Ready.</div>
+        </div>
+    </div>
+
+    <script>
+        // Set up the canvas and context
+        const canvas = document.getElementById('fireworksCanvas');
+        const ctx = canvas.getContext('2d');
+        let width = window.innerWidth;
+        let height = window.innerHeight;
+        canvas.width = width;
+        canvas.height = height;
+
+        // --- Firebase Setup (Required for API Authentication) ---
+        // Global variables provided by the environment
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        let firebaseApp, auth, db, userId;
+
+        function initFirebase() {
+            try {
+                // Use the globally loaded Firebase libraries
+                const { initializeApp } = firebase;
+                const { getAuth, signInAnonymously, signInWithCustomToken } = firebase.auth;
+                const { getFirestore } = firebase.firestore;
+                
+                firebaseApp = initializeApp(firebaseConfig);
+                auth = getAuth(firebaseApp);
+                db = getFirestore(firebaseApp);
+
+                // Sign in logic
+                const attemptAuth = async () => {
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                        userId = auth.currentUser?.uid || crypto.randomUUID();
+                        console.log("Firebase initialized and signed in. User ID:", userId);
+                    } catch (error) {
+                        console.error("Firebase authentication failed:", error);
+                        userId = crypto.randomUUID();
+                    }
+                };
+                attemptAuth();
+            } catch (error) {
+                 console.warn("Firebase initialization skipped (SDKs may not be loaded):", error);
+                 userId = crypto.randomUUID();
+            }
+        }
+        
+        // --- LLM API Utility ---
+        
+        // Implementation of exponential backoff fetch
+        async function exponentialBackoffFetch(url, options, maxRetries = 5, delay = 1000) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status !== 429) { // Not a rate limit error, or success
+                        return response;
+                    }
+                    console.log(`Rate limit hit (429). Retrying in ${delay / 1000}s...`);
+                } catch (error) {
+                    // Ignore transient network errors and retry
+                }
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; // Exponential increase
+            }
+            throw new Error(`Failed to fetch ${url} after ${maxRetries} attempts.`);
+        }
+
+        // Global state for fireworks and particles
+        const fireworks = [];
+        const particles = [];
+        
+        // MODIFIABLE STATE VARIABLES (LLM can change these)
+        let currentGravity = 0.04; // Gravity magnitude
+        let explosionIntensity = 1.0; // Multiplier for particle count
+        let currentColors = [
+            '#FFD700', '#FF4500', '#ADFF2F', '#00FFFF', '#FF69B4', '#1E90FF', '#9370DB', '#FFA07A' // Default colors
+        ];
+
+        // --- Utility Functions ---
+
+        /**
+         * Get a random integer between min (inclusive) and max (inclusive)
+         */
+        function random(min, max) {
+            return Math.random() * (max - min) + min;
+        }
+
+        /**
+         * Get a random element from an array
+         */
+        function randomChoice(arr) {
+            return arr[Math.floor(Math.random() * arr.length)];
+        }
+        
+        /**
+         * Generates a firework design (colors/physics) using the Gemini API.
+         */
+        async function generateFireworkDesign(prompt) {
+            const apiKey = ""; // Left empty, provided by environment
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+            
+            const systemPrompt = `You are a creative pyrotechnic designer. Based on the user's theme, generate a unique name, a brief descriptive style, and a list of 5 to 8 vivid color hex codes that fit the theme. The hex codes MUST be visually distinct and bright, suitable for fireworks (e.g., avoiding black, grey, or very dark colors). Do not include any text outside the JSON object.`;
+            
+            const payload = {
+                contents: [{ parts: [{ text: `Theme: ${prompt}` }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "showName": { "type": "STRING" },
+                            "styleDescription": { "type": "STRING" },
+                            "colors": {
+                                "type": "ARRAY",
+                                "items": { "type": "STRING" }
+                            }
+                        },
+                        "required": ["showName", "styleDescription", "colors"]
+                    }
+                }
+            };
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const jsonText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (jsonText) {
+                    return JSON.parse(jsonText);
+                }
+                throw new Error("Invalid or empty response from API.");
+
+            } catch (error) {
+                console.error("Gemini API Error:", error);
+                return null;
+            }
+        }
+        
+        /**
+         * Applies the LLM-generated design to the global state variables.
+         */
+        function applyDesign(design) {
+            // 1. Apply Colors
+            const validHex = design.colors.filter(c => /^#[0-9A-F]{6}$/i.test(c));
+            currentColors = validHex.length >= 3 ? validHex : currentColors;
+            
+            // 2. Adjust Physics based on keywords
+            const desc = design.styleDescription.toLowerCase();
+            
+            // Slower, more gentle theme
+            if (desc.includes('slow') || desc.includes('dreamy') || desc.includes('gentle') || desc.includes('subtle')) {
+                currentGravity = 0.02; 
+                explosionIntensity = 0.7; 
+            // Faster, more intense theme
+            } else if (desc.includes('rapid') || desc.includes('chaotic') || desc.includes('intense') || desc.includes('power') || desc.includes('fast')) {
+                currentGravity = 0.06; 
+                explosionIntensity = 1.5; 
+            // Balanced theme
+            } else {
+                currentGravity = 0.04;
+                explosionIntensity = 1.0;
+            }
+            
+            // 3. Update UI
+            document.getElementById('designStatus').textContent = `Theme: ${design.showName} | Style: ${design.styleDescription}.`;
+            document.getElementById('controls').querySelector('p').textContent = `Click/tap to launch the custom show!`;
+        }
+
+
+        // --- Particle Class (The Explosion Sparks) ---
+
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                this.angle = random(0, Math.PI * 2);
+                this.speed = random(1, 10);
+                this.friction = 0.95;
+                this.velocity = {
+                    x: Math.cos(this.angle) * this.speed * random(0.5, 1.5),
+                    y: Math.sin(this.angle) * this.speed * random(0.5, 1.5)
+                };
+                this.alpha = 1; // opacity
+                this.decay = random(0.015, 0.03); // speed of fading
+                this.size = random(1, 3);
+            }
+
+            update() {
+                // Apply friction
+                this.velocity.x *= this.friction;
+                this.velocity.y *= this.friction;
+
+                // Apply dynamic gravity
+                this.velocity.y += currentGravity * 2; // Stronger gravity for particles
+
+                // Update position
+                this.x += this.velocity.x;
+                this.y += this.velocity.y;
+
+                // Fade out
+                this.alpha -= this.decay;
+            }
+
+            draw() {
+                ctx.save();
+                ctx.globalAlpha = this.alpha;
+                ctx.fillStyle = this.color;
+                ctx.fillRect(this.x, this.y, this.size, this.size);
+                ctx.restore();
+            }
+        }
+
+        // --- Firework Class (The Rocket Launch) ---
+
+        class Firework {
+            constructor(startX, startY, targetX, targetY) {
+                this.x = startX;
+                this.y = startY;
+                this.startX = startX;
+                this.startY = startY;
+                this.targetX = targetX;
+                this.targetY = targetY;
+
+                // Calculate distance
+                const dx = targetX - startX;
+                const dy = targetY - startY;
+                this.distance = Math.sqrt(dx * dx + dy * dy);
+                this.distanceTraveled = 0;
+
+                // Calculate speed and velocity
+                this.speed = random(5, 8);
+                this.angle = Math.atan2(dy, dx);
+                this.velocity = {
+                    x: Math.cos(this.angle) * this.speed,
+                    y: Math.sin(this.angle) * this.speed
+                };
+
+                // Use the globally set colors
+                this.color = randomChoice(currentColors);
+                this.trailParticles = [];
+                this.exploded = false;
+            }
+
+            update() {
+                if (this.exploded) return;
+
+                // Calculate the distance traveled since the last update
+                const previousX = this.x;
+                const previousY = this.y;
+
+                // Update velocity with dynamic gravity
+                this.velocity.y += currentGravity;
+
+                // Update position
+                this.x += this.velocity.x;
+                this.y += this.velocity.y;
+
+                // Calculate new distance traveled
+                const distanceToTarget = Math.sqrt(
+                    Math.pow(this.x - this.startX, 2) +
+                    Math.pow(this.y - this.startY, 2)
+                );
+
+                // Check for explosion criteria: past the target or going downwards heavily
+                const shouldExplode = distanceToTarget >= this.distance || this.velocity.y > 0.5;
+
+                if (shouldExplode) {
+                    this.explode();
+                } else {
+                    // Create a small trail particle
+                    this.trailParticles.push(new Particle(previousX, previousY, 'rgba(255, 255, 255, 0.5)'));
+                    // Keep the trail particles count low for performance
+                    if (this.trailParticles.length > 5) {
+                        this.trailParticles.shift();
+                    }
+                }
+            }
+
+            draw() {
+                if (this.exploded) return;
+
+                // Draw trail particles
+                this.trailParticles.forEach((p, i) => {
+                    p.alpha = i / this.trailParticles.length * 0.5; // Fading trail
+                    p.draw();
+                });
+
+                // Draw the main rocket dot
+                ctx.save();
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, 2, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            explode() {
+                this.exploded = true;
+                // Scale particle count by explosionIntensity
+                const particleCount = random(80 * explosionIntensity, 150 * explosionIntensity);
+
+                // Create a burst of particles
+                for (let i = 0; i < particleCount; i++) {
+                    particles.push(new Particle(this.x, this.y, this.color));
+                }
+            }
+        }
+
+        // --- Main Animation and Event Loop ---
+
+        /**
+         * Clears the canvas and draws the objects.
+         */
+        function draw() {
+            // Apply a fade effect instead of full clear to create trails
+            ctx.globalCompositeOperation = 'destination-out';
+            ctx.fillStyle = 'rgba(13, 13, 26, 0.1)'; // Slow fade
+            ctx.fillRect(0, 0, width, height);
+            ctx.globalCompositeOperation = 'lighter'; // Additive blending for brighter colors
+
+            // Draw fireworks (rockets)
+            fireworks.forEach(firework => firework.draw());
+
+            // Draw particles (explosion sparks)
+            particles.forEach(particle => particle.draw());
+        }
+
+        /**
+         * Updates the state of all fireworks and particles.
+         */
+        function update() {
+            // Update fireworks and clean up exploded ones
+            for (let i = fireworks.length - 1; i >= 0; i--) {
+                const firework = fireworks[i];
+                firework.update();
+                if (firework.exploded) {
+                    // Remove the exploded firework after its particles are generated
+                    fireworks.splice(i, 1);
+                }
+            }
+
+            // Update particles and clean up faded ones
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const particle = particles[i];
+                particle.update();
+                if (particle.alpha <= particle.decay) {
+                    // Remove faded particle
+                    particles.splice(i, 1);
+                }
+            }
+        }
+
+        /**
+         * Main animation loop
+         */
+        function loop() {
+            requestAnimationFrame(loop);
+            update();
+            draw();
+        }
+
+        /**
+         * Launches a firework from the bottom center towards the click/tap coordinates.
+         * @param {number} x
+         * @param {number} y
+         */
+        function launchFirework(x, y) {
+            // Launch from the bottom center
+            const startX = width / 2;
+            const startY = height;
+            fireworks.push(new Firework(startX, startY, x, y));
+        }
+
+        // --- Event Listeners and Initialization ---
+
+        // Handle window resizing
+        window.addEventListener('resize', () => {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+        });
+
+        // Handle mouse clicks
+        canvas.addEventListener('click', (e) => {
+            launchFirework(e.clientX, e.clientY);
+        });
+
+        // Handle touch taps (for mobile)
+        canvas.addEventListener('touchstart', (e) => {
+            // Prevent scrolling on touch
+            e.preventDefault();
+            const touch = e.touches[0];
+            launchFirework(touch.clientX, touch.clientY);
+        });
+        
+        // LLM Button Listener
+        document.addEventListener('DOMContentLoaded', () => {
+             const designButton = document.getElementById('designButton');
+             const promptInput = document.getElementById('promptInput');
+
+             designButton.addEventListener('click', async () => {
+                const prompt = promptInput.value.trim();
+                if (!prompt) {
+                    document.getElementById('designStatus').textContent = "Please enter a theme!";
+                    return;
+                }
+                
+                const originalText = designButton.innerHTML;
+                designButton.disabled = true;
+                designButton.innerHTML = 'Designing...';
+                document.getElementById('designStatus').textContent = "Consulting the Pyrotechnics Master...";
+
+                // Call the Gemini API
+                const design = await generateFireworkDesign(prompt);
+                
+                designButton.disabled = false;
+                designButton.innerHTML = originalText;
+                
+                if (design) {
+                    applyDesign(design);
+                    // Launch a sample firework with the new design
+                    launchFirework(width / 2, height / 3);
+                } else {
+                    document.getElementById('designStatus').textContent = "Error: Could not generate design. Check console.";
+                }
+            });
+        });
+
+        // Initial setup on window load
+        window.onload = function() {
+            initFirebase();
+            
+            // Initial launch of a few fireworks to start the show
+            launchFirework(width / 4, height / 4);
+            launchFirework(width / 2, height / 3);
+            launchFirework(width * 3 / 4, height / 4);
+            loop(); // Start the animation loop
+        };
+    </script>
+</body>
+</html>
